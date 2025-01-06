@@ -1,9 +1,7 @@
 FROM docker.io/rust:alpine AS builder
 
 ARG TRIPSU_VERSION="0.2.0"
-
 WORKDIR /app/
-RUN USER=root
 
 RUN apk add --no-cache \
   git \
@@ -27,6 +25,9 @@ RUN apk add --no-cache \
   jq \
   just \
   watchexec
+
+RUN addgroup -S syncgroup && adduser -S syncuser -G syncgroup
+USER syncuser
 
 # Include required binaries into the image
 COPY --from=builder /app/tripsu/target/release/tripsu /usr/bin/tripsu
