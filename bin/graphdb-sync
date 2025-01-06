@@ -1,0 +1,192 @@
+#!/bin/bash
+# Migrate target named graph from one GraphDB instance to another
+# Safer options:
+# - error on unbound variable (u)
+# - propagate errors in pipes (-o pipefail)
+set -uo pipefail
+# Source .env file for graphdb credentials
+set -o allexport
+source .env
+set +o allexport
+
+#############
+### SETUP ###
+#############
+
+# Setup logging with debug mode (x)
+LOGFILE="${LOGDIR:-.}/$(date +"%Y-%m-%dT%T")_$$_graphdb-syncer.log"
+BATCH_SIZE=20000000
+# fd3 -> console
+# (fd1 + fd2) -> logfile
+exec 3>&1 1>"${LOGFILE}" 2>&1
+# On non-zero exit, script prints this to console
+trap 'echo "ERROR: An error occurred during execution, check log $LOGFILE for details." >&3' ERR
+# Debug mode + timestamp printed to logfile (only) for every command
+trap '{ set +x; } 2>/dev/null; echo -n "[$(date -Is)]  "; set -x' DEBUG
+
+# fail early if no query provided
+if [ -z ${QUERY_PATH+x} ]; then
+  echo "QUERY_PATH not set, please provide a query file" >&3
+  exit 1
+fi
+# User-inputted named graph to migrate
+if [ "$#" -ne 2 ]; then
+  echo "Please specify the source and target graph names" >&3
+  exit 1
+fi
+SOURCE_GRAPH="${1}"
+TARGET_GRAPH="${2}"
+
+if [ "${SOURCE_GRAPH}" == "${TARGET_GRAPH}" ]; then
+  echo "Source and target graph names must be different" >&3
+  exit 1
+fi
+
+# Create dump file and ensure it is cleaned up on EXIT
+TMP_DUMP=$( mktemp -up "${TMPDIR:-/tmp}" triple-dump.XXXXXX )
+trap 'rm -- "${TMP_DUMP}"-*.*' EXIT
+
+# Globally used curl options
+CURL_OPTIONS=( -s -k --fail )
+
+#################
+### FUNCTIONS ###
+#################
+
+# URLencode input string
+rawurlencode() {
+  set +x
+  local string="${1}"
+  local strlen=${#string}
+  local encoded=""
+  local pos c o
+
+  for (( pos=0 ; pos<strlen ; pos++ )); do
+     c=${string:$pos:1}
+     case "$c" in
+        [-_.~a-zA-Z0-9] ) o="${c}" ;;
+        * )               printf -v o '%%%02x' "'$c"
+     esac
+     encoded+="${o}"
+  done
+  echo "${encoded}"
+  set -x
+}
+
+# Build authentication headers for graphdb
+graphdb_auth() {
+  local endpoint username password
+  endpoint="${1}/rest/login"
+  # NOTE: sanitize for json. should be done w/o erasing
+  username="$(echo "${2}" | tr -d \@\!:\'\"\\n)"
+  password="$(echo "${3}" | tr -d \@\!:\'\"\\n)"
+  curl \
+    -iX POST \
+    -H 'Content-Type: application/json' \
+    -d "{
+      \"username\": \"${username}\",
+      \"password\": \"${password}\"
+    }" \
+    "${CURL_OPTIONS[@]}" \
+    -- "${endpoint}" \
+  | awk '/^Authorization: GDB/ {print $0}' \
+  | tr -d '\r\n'
+}
+
+log_result() {
+  local status msg
+  status="${1}"
+  msg="${2}"
+  if [ "${status}" -ne 0 ]; then
+    echo "FAIL: ${msg}" >&3
+    exit 1
+  fi
+  echo "DONE: ${msg}" >&3
+}
+
+#############
+### LOGIN ###
+#############
+
+# Log in to both instances
+SOURCE_AUTH=$( graphdb_auth "${SOURCE}" "${SOURCE_USER}" "${SOURCE_PASS}" )
+TARGET_AUTH=$( graphdb_auth "${TARGET}" "${TARGET_USER}" "${TARGET_PASS}" )
+
+################
+### DOWNLOAD ###
+################
+
+MSG="find source graph in source repo"
+curl \
+  -X GET \
+  -H "${SOURCE_AUTH}" \
+  "${CURL_OPTIONS[@]}" \
+  -- "${SOURCE}/repositories/${SOURCE_REPO}/rdf-graphs" \
+| tr -d '\r ' \
+| grep -- '^'"${SOURCE_GRAPH}"'$' \
+| sed -re '/^$/d'
+log_result $? "${MSG}"
+
+TARGET_GRAPH_URL=$(rawurlencode "${TARGET_GRAPH}")
+
+
+# Source named graph URI injected dynamically in SPARQL query
+# Download triples based on CONSTRUCT query.
+MSG="download triples from source repo"
+SOURCE_GRAPH="${SOURCE_GRAPH}" \
+  envsubst '${SOURCE_GRAPH}' \
+  < "${QUERY_PATH}" \
+| curl \
+    -X POST \
+    -H "${SOURCE_AUTH}" \
+    --data-binary @- \
+    -H 'Content-Type: application/sparql-query' \
+    "${CURL_OPTIONS[@]}" \
+    -- "${SOURCE}/repositories/${SOURCE_REPO}" \
+> "${TMP_DUMP}-raw.nt"
+
+####################
+### PSEUDONYMIZE ###
+####################
+
+tripsu index -o "${TMP_DUMP}-index.json" "${TMP_DUMP}-raw.nt" 
+# NOTE: using random seed, could use a salt file if needed.
+# pseudonymize -> quadify -> split by batch size -> compress
+tripsu pseudo \
+  --rules "config/pseudo.yaml" \
+  --index "${TMP_DUMP}-index.json" \
+  "${TMP_DUMP}-raw.nt" \
+| sed 's|^\(.*\) \.|\1 '"<${TARGET_GRAPH}> .|" \
+| split -a6 -l "${BATCH_SIZE}" --numeric-suffixes --filter='gzip >'"${TMP_DUMP}-"'$FILE.nq.gz' -
+log_result $? "${MSG}"
+echo "INFO: $(du -shc ${TMP_DUMP}-*nq.gz | tail -n1 | cut -f -1) of compressed triple data downloaded" >&3
+
+##############
+### UPLOAD ###
+##############
+
+MSG="delete target graph from target repo"
+curl \
+  -X DELETE \
+  -H "${TARGET_AUTH}" \
+  "${CURL_OPTIONS[@]}" \
+  -- "${TARGET}/repositories/${TARGET_REPO}/rdf-graphs/service?graph=${TARGET_GRAPH_URL}"
+log_result $? "${MSG}"
+
+# upload quads for target repo in batches
+batch_num=0
+batch_tot=$(find $(dirname ${TMP_DUMP}) -name "${TMP_DUMP##*/}-*.nq.gz" -printf '.' | wc -m)
+for batch_file in ${TMP_DUMP}-*.nq.gz; do
+  MSG="upload quads to target repo [batch ${batch_num} / ${batch_tot}]"
+  curl \
+    -X POST \
+    -H "${TARGET_AUTH}" \
+    -H 'Content-Type: application/n-quads' \
+    -H 'Accept: application/json' \
+    -H 'Transfer-Encoding: chunked' \
+    -T "${batch_file}" \
+    "${CURL_OPTIONS[@]}" \
+    -- "${TARGET}/repositories/${TARGET_REPO}/rdf-graphs/service?graph=${TARGET_GRAPH_URL}"
+  batch_num=$((batch_num+1))
+  log_result $? "${MSG}"
+done
