@@ -4,6 +4,7 @@ container_runtime := "podman"
 export TMPDIR := env("TMPDIR", "/tmp")
 export LOGDIR := env("LOGDIR", "log")
 export QUERY_PATH := env("QUERY_PATH", "")
+export UID := env("UID", "1000")
 
 
 default:
@@ -13,7 +14,8 @@ _containerize *cmd:
   {{container_runtime}} run --rm \
   -it \
   -v "${PWD}:/app" \
-  -v {{TMPDIR}}/syncer:/tmp/syncer \
+  -v {{TMPDIR}}/syncer:/tmp/syncer:rw \
+  -u {{UID}} \
   -e TMPDIR=/tmp/syncer \
   -e QUERY_PATH={{QUERY_PATH}} \
   -e LOGDIR={{LOGDIR}} \
