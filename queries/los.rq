@@ -1,0 +1,30 @@
+# Extract required concepts for the low value care project.
+# Pseudonymize all identifiers (hash and salt with project name)
+# PREFIX sphn: <https://biomedit.ch/rdf/sphn-ontology/sphn#>
+# CONSTRUCT a graph including only nodes of requested types + their outgoing edges
+# NOTE: The resulting graph will contain URIs without types and likely be SHACL-invalid
+
+PREFIX sphn: <https://biomedit.ch/rdf/sphn-schema/sphn#>
+
+CONSTRUCT {
+  ?s ?p ?o .
+  ?o a ?ext_code .
+}
+WHERE {
+  # Restrict to concepts of interest
+  VALUES ?excluded_concept {
+    sphn:Consent
+    sphn:SourceSystem
+  }
+  # Instance nodes for each concept and their outgoing edges
+  GRAPH <${SOURCE_GRAPH}> {
+    ?s a ?concept .
+    FILTER(?concept NOT IN (?excluded_concept))
+    ?s ?p ?o .
+
+    OPTIONAL {
+      FILTER(STRENDS(STR(?p), "Code"))
+      ?o a ?ext_code .
+    }
+  }
+}
