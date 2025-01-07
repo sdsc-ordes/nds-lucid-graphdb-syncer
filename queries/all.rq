@@ -1,0 +1,10 @@
+# Retrieve all variables (default query)
+CONSTRUCT {
+    ?s ?p ?o .
+}
+WHERE {
+  GRAPH <${SOURCE_GRAPH}> {
+    ?s ?p ?o .
+  }
+}
+
